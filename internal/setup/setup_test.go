@@ -23,10 +23,10 @@ import (
 
 	"github.com/google/exposure-notifications-server/internal/authorizedapp"
 	"github.com/google/exposure-notifications-server/internal/database"
-	"github.com/google/exposure-notifications-server/internal/observability"
 	"github.com/google/exposure-notifications-server/internal/setup"
 	"github.com/google/exposure-notifications-server/internal/storage"
 	"github.com/google/exposure-notifications-server/pkg/keys"
+	"github.com/google/exposure-notifications-server/pkg/observability"
 	"github.com/google/exposure-notifications-server/pkg/secrets"
 	"github.com/sethvargo/go-envconfig"
 )
@@ -231,9 +231,10 @@ func TestSetupWith(t *testing.T) {
 		if oe == nil {
 			t.Errorf("expected observability exporter to exist")
 		}
-
-		if _, ok := oe.(*observability.NoopExporter); !ok {
-			t.Errorf("expected %T to be GenericExporter", oe)
-		}
+		defer func() {
+			if err := oe.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
 	})
 }

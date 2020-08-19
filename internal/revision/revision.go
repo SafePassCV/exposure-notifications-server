@@ -28,10 +28,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/exposure-notifications-server/internal/logging"
 	"github.com/google/exposure-notifications-server/internal/pb"
 	"github.com/google/exposure-notifications-server/internal/publish/model"
 	"github.com/google/exposure-notifications-server/internal/revision/database"
+	"github.com/google/exposure-notifications-server/pkg/logging"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -186,24 +186,27 @@ func buildTokenBufer(previous *pb.RevisionTokenData, eKeys []*model.Exposure) *p
 		RevisableKeys: make([]*pb.RevisableKey, 0, len(eKeys)),
 	}
 	got := make(map[string]struct{})
-	for _, k := range eKeys {
-		got[k.ExposureKeyBase64()] = struct{}{}
-		pbKey := pb.RevisableKey{
-			TemporaryExposureKey: make([]byte, len(k.ExposureKey)),
-			IntervalNumber:       k.IntervalNumber,
-			IntervalCount:        k.IntervalCount,
-		}
-		copy(pbKey.TemporaryExposureKey, k.ExposureKey)
-		tokenData.RevisableKeys = append(tokenData.RevisableKeys, &pbKey)
-	}
-	// Add in previous keys that weren't also in the new exposures
+
+	// Add in previous keys from the revision token. This needs to come first so
+	// the revision token is valid for all keys, not just the ones uploaded now.
 	if previous != nil {
 		for _, rk := range previous.RevisableKeys {
-			if _, ok := got[base64.StdEncoding.EncodeToString(rk.TemporaryExposureKey)]; !ok {
-				tokenData.RevisableKeys = append(tokenData.RevisableKeys, rk)
-			}
+			got[base64.StdEncoding.EncodeToString(rk.TemporaryExposureKey)] = struct{}{}
+			tokenData.RevisableKeys = append(tokenData.RevisableKeys, rk)
 		}
 	}
+
+	// Now add new keys and their metadata, iff they aren't already in the list.
+	for _, k := range eKeys {
+		if _, ok := got[k.ExposureKeyBase64()]; !ok {
+			tokenData.RevisableKeys = append(tokenData.RevisableKeys, &pb.RevisableKey{
+				TemporaryExposureKey: append([]byte{}, k.ExposureKey...), // deep copy
+				IntervalNumber:       k.IntervalNumber,
+				IntervalCount:        k.IntervalCount,
+			})
+		}
+	}
+
 	return &tokenData
 }
 

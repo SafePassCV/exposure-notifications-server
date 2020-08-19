@@ -54,6 +54,9 @@ const (
 	// ErrorInvalidRevisionToken indicates a revision token was passed, but is missing a
 	// key or has invalid metadata.
 	ErrorInvalidRevisionToken = "invalid_revision_token"
+	// ErrorPartialFailure indicates that some exposure keys in the publish request had invalid
+	// data (size, timing metadata) and were dropped. Other keys were saved.
+	ErrorPartialFailure = "partial_failure"
 )
 
 // Publish represents the body of the PublishInfectedIds API call.
@@ -62,7 +65,7 @@ const (
 //  - Android: The App Package AppPackageName
 //  - iOS: The BundleID
 // verificationPayload: The Verification Certificate from a verification server.
-// hmacKey: the device generated secret that is used to recalcualte the HMAC value
+// hmacKey: the device generated secret that is used to recalculate the HMAC value
 //  that is present in the verification payload.
 //
 // symptomOnsetInterval: An interval number that aligns with the symptom onset date.
@@ -77,12 +80,19 @@ const (
 //  keys of a "traveler" who has left the home region represented by this server
 //  (or by the home health authority in case of a multi-tenant installation).
 //
-// revisionToken: An opaque string that must be passed in-tact from on additional
-//   publish requests from the same device, there the same TEKs may be published
+// revisionToken: An opaque string that must be passed intact on additional
+//   publish requests from the same device, where the same TEKs may be published
 //   again.
 //
 // Padding: random base64 encoded data to obscure the request size. The server will
 // not process this data in any way.
+//
+// Partial success: If at least one of the Keys passed in is valid, then the publish
+// request will accept those keys, return a response code of 200 (OK) AND also
+// return a 'Code' of ErrorPartialFailure allong with an error message of
+// exactly which keys were not accepted and why. This does not indicate a failure
+// that must be reported to the user, but does indicate an issue with the application
+// making the upload (sending invalid data).
 type Publish struct {
 	Keys                 []ExposureKey `json:"temporaryExposureKeys"`
 	HealthAuthorityID    string        `json:"healthAuthorityID"`

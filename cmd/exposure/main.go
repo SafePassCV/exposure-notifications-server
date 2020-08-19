@@ -20,17 +20,19 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/google/exposure-notifications-server/internal/logging"
-	_ "github.com/google/exposure-notifications-server/internal/observability"
 	"github.com/google/exposure-notifications-server/internal/publish"
 	"github.com/google/exposure-notifications-server/internal/setup"
+	"github.com/google/exposure-notifications-server/pkg/logging"
+	_ "github.com/google/exposure-notifications-server/pkg/observability"
 	"github.com/google/exposure-notifications-server/pkg/server"
 	"github.com/sethvargo/go-signalcontext"
 )
 
 func main() {
 	ctx, done := signalcontext.OnInterrupt()
-	logger := logging.FromContext(ctx)
+
+	logger := logging.NewLogger(true)
+	ctx = logging.WithLogger(ctx, logger)
 
 	err := realMain(ctx)
 	done()

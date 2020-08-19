@@ -16,59 +16,50 @@
 package observability
 
 import (
+	"context"
 	"fmt"
-	"sync"
+	"io"
 
 	"go.opencensus.io/plugin/ocgrpc"
 	"go.opencensus.io/plugin/ochttp"
 	"go.opencensus.io/stats/view"
-	"go.opencensus.io/trace"
 )
 
-// Compile-time check to verify implements interface.
-var _ Exporter = (*GenericExporter)(nil)
-
-var initExporterOnce sync.Once
-
-type traceAndViewExporter interface {
-	trace.Exporter
-	view.Exporter
+// Exporter defines the minimum shared functionality for an observability exporter
+// used by this application.
+type Exporter interface {
+	io.Closer
+	StartExporter() error
 }
 
-// GenericExporter is a standard implementation of an exporter that wraps the opencensus interfaces
-// with custom configuration
-type GenericExporter struct {
-	exporter   traceAndViewExporter
-	sampleRate float64
-}
-
-func (g *GenericExporter) InitExportOnce() error {
-	var err error
-	initExporterOnce.Do(func() {
-		err = g.initExporter()
-	})
-	return err
-}
-
-func (g *GenericExporter) initExporter() error {
-	if g.exporter == nil {
-		return nil
+// NewFromEnv returns the observability exporter given the provided configuration, or an error
+// if it failed to be created.
+func NewFromEnv(ctx context.Context, config *Config) (Exporter, error) {
+	switch config.ExporterType {
+	case ExporterNoop:
+		return NewNoop(ctx)
+	case ExporterStackdriver:
+		return NewStackdriver(ctx, config.Stackdriver)
+	case ExporterOCAgent, ExporterPrometheus:
+		return NewOpenCensus(ctx, config.OpenCensus)
+	default:
+		return nil, fmt.Errorf("unknown observability exporter type %v", config.ExporterType)
 	}
-	trace.ApplyConfig(trace.Config{
-		DefaultSampler: trace.ProbabilitySampler(g.sampleRate),
-	})
-	trace.RegisterExporter(g.exporter)
-	view.RegisterExporter(g.exporter)
+}
 
+// registerViews registers the necessary tracing views.
+func registerViews() error {
 	// Record the various HTTP view to collect metrics.
 	httpViews := append(ochttp.DefaultServerViews, ochttp.DefaultClientViews...)
 	if err := view.Register(httpViews...); err != nil {
-		return fmt.Errorf("failed to register http views for observability exporter: %v", err)
+		return fmt.Errorf("failed to register http views: %w", err)
 	}
+
 	// Register the various gRPC views to collect metrics.
 	gRPCViews := append(ocgrpc.DefaultServerViews, ocgrpc.DefaultClientViews...)
 	if err := view.Register(gRPCViews...); err != nil {
-		return fmt.Errorf("failed to register grpc views for observability exporter: %v", err)
+		return fmt.Errorf("failed to register grpc views: %w", err)
 	}
+
 	return nil
 }

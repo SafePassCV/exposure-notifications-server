@@ -26,7 +26,6 @@ import (
 	"go.opencensus.io/trace"
 
 	"github.com/google/exposure-notifications-server/internal/authorizedapp"
-	"github.com/google/exposure-notifications-server/internal/logging"
 	"github.com/google/exposure-notifications-server/internal/pb"
 	"github.com/google/exposure-notifications-server/internal/publish/database"
 	"github.com/google/exposure-notifications-server/internal/publish/model"
@@ -37,6 +36,7 @@ import (
 	verifydb "github.com/google/exposure-notifications-server/internal/verification/database"
 	verifyapi "github.com/google/exposure-notifications-server/pkg/api/v1"
 	"github.com/google/exposure-notifications-server/pkg/base64util"
+	"github.com/google/exposure-notifications-server/pkg/logging"
 	"github.com/mikehelmick/go-chaff"
 )
 
@@ -72,7 +72,7 @@ func NewHandler(ctx context.Context, config *Config, env *serverenv.ServerEnv) (
 
 	aadBytes := config.RevisionToken.AAD
 	if len(aadBytes) == 0 {
-		return nil, fmt.Errorf("must provide ADD for revision token encryption in REVISION_TOKEN_AAD env variable: %w", err)
+		return nil, fmt.Errorf("must provide ADD for revision token encryption in REVISION_TOKEN_AAD env variable")
 	}
 	revisionKeyConfig := revisiondb.KMSConfig{
 		WrapperKeyID: config.RevisionToken.KeyID,
@@ -249,6 +249,7 @@ func (h *PublishHandler) process(ctx context.Context, data *verifyapi.Publish, b
 
 	// Examine the revision token. It is expected that it is missing in most cases.
 	var token *pb.RevisionTokenData
+	decryptFail := false
 	if len(data.RevisionToken) != 0 {
 		encryptedToken, err := base64util.DecodeString(data.RevisionToken)
 		if err != nil {
@@ -256,16 +257,20 @@ func (h *PublishHandler) process(ctx context.Context, data *verifyapi.Publish, b
 		} else {
 			token, err = h.tokenManager.UnmarshalRevisionToken(ctx, encryptedToken, h.tokenAAD)
 			if err != nil {
-				logger.Errorf("unable to unmarshall / descrypt revision token: %v", err)
+				logger.Errorf("unable to unmarshall / decrypt revision token: %v", err)
 				token = nil // just in case.
+				decryptFail = true
 			}
 		}
 	}
 
 	batchTime := time.Now()
-	exposures, err := h.transformer.TransformPublish(ctx, data, regions, verifiedClaims, batchTime)
-	if err != nil {
-		message := fmt.Sprintf("unable to read request data: %v", err)
+	exposures, transformError := h.transformer.TransformPublish(ctx, data, regions, verifiedClaims, batchTime)
+	// Check for non-recovarable error. It is possible that individual keys are dropped, but if there
+	// are any valid ones, we will try and move forward.
+	// If at the end, there is a success, the transformError will be returned as supplemental information.
+	if transformError != nil && len(exposures) == 0 {
+		message := fmt.Sprintf("unable to read request data: %v", transformError)
 		logger.Error(message)
 		span.SetStatus(trace.Status{Code: trace.StatusCodeInvalidArgument, Message: message})
 		return response{
@@ -283,14 +288,14 @@ func (h *PublishHandler) process(ctx context.Context, data *verifyapi.Publish, b
 		var logMessage, errorMessage, errorCode string
 		metric := "publish-revision-token-issue"
 		switch {
+		case decryptFail || errors.Is(err, database.ErrExistingKeyNotInToken) || errors.Is(err, database.ErrRevisionTokenMetadataMismatch):
+			logMessage = fmt.Sprintf("revision token present, but invalid: %v", err)
+			errorMessage = "revision token is invalid"
+			errorCode = verifyapi.ErrorInvalidRevisionToken
 		case errors.Is(err, database.ErrNoRevisionToken):
 			logMessage = "no revision token"
 			errorMessage = "no revision token, but sent existing keys"
 			errorCode = verifyapi.ErrorMissingRevisionToken
-		case errors.Is(err, database.ErrExistingKeyNotInToken) || errors.Is(err, database.ErrRevisionTokenMetadataMismatch):
-			logMessage = fmt.Sprintf("revision token present, but invalid: %v", err)
-			errorMessage = "revision token is invalid"
-			errorCode = verifyapi.ErrorInvalidRevisionToken
 		default:
 			logMessage = fmt.Sprintf("error writing exposure record: %v", err)
 			errorMessage = http.StatusText(http.StatusInternalServerError)
@@ -330,13 +335,21 @@ func (h *PublishHandler) process(ctx context.Context, data *verifyapi.Publish, b
 	message := fmt.Sprintf("Inserted %d exposures.", n)
 	span.AddAttributes(trace.Int64Attribute("inserted_exposures", int64(n)))
 	logger.Info(message)
+
+	publishResponse := verifyapi.PublishResponse{
+		RevisionToken:     base64.StdEncoding.EncodeToString(newToken),
+		InsertedExposures: n,
+	}
+	// If there was a partial failure on transform, add that information back into the success response.
+	if transformError != nil {
+		publishResponse.Code = verifyapi.ErrorPartialFailure
+		publishResponse.ErrorMessage = transformError.Error()
+	}
+
 	return response{
-		status: http.StatusOK,
-		pubResponse: &verifyapi.PublishResponse{
-			RevisionToken:     base64.StdEncoding.EncodeToString(newToken),
-			InsertedExposures: n,
-		},
-		metric: "publish-exposures-written",
-		count:  n,
+		status:      http.StatusOK,
+		pubResponse: &publishResponse,
+		metric:      "publish-exposures-written",
+		count:       n,
 	}
 }

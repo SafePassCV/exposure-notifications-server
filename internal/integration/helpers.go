@@ -30,6 +30,7 @@ import (
 	"github.com/google/exposure-notifications-server/internal/database"
 	"github.com/google/exposure-notifications-server/internal/export"
 	"github.com/google/exposure-notifications-server/internal/federationin"
+	"github.com/google/exposure-notifications-server/internal/keyrotation"
 	"github.com/google/exposure-notifications-server/internal/publish"
 	"github.com/google/exposure-notifications-server/internal/revision"
 	revdb "github.com/google/exposure-notifications-server/internal/revision/database"
@@ -40,6 +41,7 @@ import (
 	"github.com/google/exposure-notifications-server/pkg/keys"
 	"github.com/google/exposure-notifications-server/pkg/secrets"
 	"github.com/google/exposure-notifications-server/pkg/server"
+	"github.com/sethvargo/go-envconfig"
 	"github.com/sethvargo/go-retry"
 
 	authorizedappmodel "github.com/google/exposure-notifications-server/internal/authorizedapp/model"
@@ -50,15 +52,16 @@ import (
 )
 
 var (
-	ExportDir    = "my-bucket"
+	// ExportDir is the default export bucket of blob storage
+	ExportDir = "my-bucket"
+	// FileNameRoot is the default file path root under blob storage
 	FileNameRoot = "/"
-	jwtCfg       = testutil.JWTConfig{}
 )
 
 // NewTestServer sets up clients used for integration tests
-func NewTestServer(tb testing.TB, exportPeriod time.Duration) (*serverenv.ServerEnv, *Client, *database.DB) {
+func NewTestServer(tb testing.TB, exportPeriod time.Duration) (*serverenv.ServerEnv, *Client, *database.DB, testutil.JWTConfig) {
 	ctx := context.Background()
-	env, client := testServer(tb)
+	env, client, jwtCfg := testServer(tb)
 	db := env.Database()
 	enClient := &Client{client: client}
 
@@ -103,14 +106,17 @@ func NewTestServer(tb testing.TB, exportPeriod time.Duration) (*serverenv.Server
 		tb.Fatal(err)
 	}
 
-	return env, enClient, db
+	return env, enClient, db, jwtCfg
 }
 
 // testServer sets up mocked local servers for running tests
-func testServer(tb testing.TB) (*serverenv.ServerEnv, *http.Client) {
+func testServer(tb testing.TB) (*serverenv.ServerEnv, *http.Client, testutil.JWTConfig) {
 	tb.Helper()
 
-	ctx := context.Background()
+	var (
+		ctx    = context.Background()
+		jwtCfg = testutil.JWTConfig{}
+	)
 
 	aa, err := authorizedapp.NewMemoryProvider(ctx, nil)
 	if err != nil {
@@ -130,15 +136,31 @@ func testServer(tb testing.TB) (*serverenv.ServerEnv, *http.Client) {
 	}
 
 	db := database.NewTestDatabase(tb)
+	if v := os.Getenv("DB_NAME"); v != "" && !testing.Short() {
+		dbConfig := &database.Config{}
+		sm, err := secrets.SecretManagerFor(ctx, secrets.SecretManagerTypeGoogleSecretManager)
+		if err != nil {
+			tb.Fatalf("unable to connect to secret manager: %v", err)
+		}
+		if err := envconfig.ProcessWith(ctx, dbConfig, envconfig.OsLookuper(),
+			secrets.Resolver(sm, &secrets.Config{})); err != nil {
+			tb.Fatalf("error loading environment variables: %v", err)
+		}
+
+		db, err = database.NewFromEnv(ctx, dbConfig)
+		if err != nil {
+			tb.Fatalf("unable to connect to database: %v", err)
+		}
+	}
 
 	km, err := keys.NewInMemory(ctx)
 	if err != nil {
 		tb.Fatal(err)
 	}
-	if err := km.AddEncryptionKey("tokenkey"); err != nil {
+	if _, err := km.CreateEncryptionKey("tokenkey"); err != nil {
 		tb.Fatal(err)
 	}
-	if err := km.AddSigningKey("signingkey"); err != nil {
+	if _, err := km.CreateSigningKey("signingkey"); err != nil {
 		tb.Fatal(err)
 	}
 	// create an initial revision key.
@@ -235,7 +257,8 @@ func testServer(tb testing.TB) (*serverenv.ServerEnv, *http.Client) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	mux.Handle("/export/", http.StripPrefix("/export", exportServer.Routes(ctx)))
+	exportHandler := http.StripPrefix("/export", exportServer.Routes(ctx))
+	mux.Handle("/export/", exportHandler)
 
 	// Federation
 	federationInConfig := &federationin.Config{
@@ -243,18 +266,36 @@ func testServer(tb testing.TB) (*serverenv.ServerEnv, *http.Client) {
 		TruncateWindow: 1 * time.Hour,
 	}
 
-	mux.Handle("/federation-in", federationin.NewHandler(env, federationInConfig))
+	federationinHandler := federationin.NewHandler(env, federationInConfig)
+	mux.Handle("/federation-in", federationinHandler)
 
 	// Federation out
 	// TODO: this is a grpc listener and requires a lot of setup.
 
+	revConfig := revision.Config{
+		KeyID:     "tokenkey",
+		AAD:       []byte{1, 2, 3},
+		MinLength: 28,
+	}
+
+	// Key Rotation
+	keyRotationConfig := &keyrotation.Config{
+		RevisionToken: revConfig,
+
+		// Very accellerated schedule for testing.
+		NewKeyPeriod:       100 * time.Millisecond,
+		DeleteOldKeyPeriod: 100 * time.Millisecond,
+	}
+
+	rotationServer, err := keyrotation.NewServer(keyRotationConfig, env)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	mux.Handle("/key-rotation/", http.StripPrefix("/key-rotation", rotationServer.Routes(ctx)))
+
 	// Publish
 	publishConfig := &publish.Config{
-		RevisionToken: revision.Config{
-			KeyID:     "tokenkey",
-			AAD:       []byte{1, 2, 3},
-			MinLength: 28,
-		},
+		RevisionToken:            revConfig,
 		MaxKeysOnPublish:         15,
 		MaxSameStartIntervalKeys: 2,
 		MaxIntervalAge:           360 * time.Hour,
@@ -288,7 +329,7 @@ func testServer(tb testing.TB) (*serverenv.ServerEnv, *http.Client) {
 	// Create a client
 	client := testClient(tb, srv)
 
-	return env, client
+	return env, client, jwtCfg
 }
 
 type prefixRoundTripper struct {
@@ -349,6 +390,7 @@ func Eventually(tb testing.TB, times uint64, f func() error) {
 	}
 }
 
+// IndexFilePath returns the filepath of index file under blob storage
 func IndexFilePath() string {
 	return path.Join(FileNameRoot, "index.txt")
 }

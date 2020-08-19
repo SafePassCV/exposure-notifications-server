@@ -23,9 +23,9 @@ import (
 	"github.com/google/exposure-notifications-server/internal/authorizedapp"
 	"github.com/google/exposure-notifications-server/internal/database"
 	"github.com/google/exposure-notifications-server/internal/metrics"
-	"github.com/google/exposure-notifications-server/internal/observability"
 	"github.com/google/exposure-notifications-server/internal/storage"
 	"github.com/google/exposure-notifications-server/pkg/keys"
+	"github.com/google/exposure-notifications-server/pkg/observability"
 	"github.com/google/exposure-notifications-server/pkg/secrets"
 )
 
@@ -176,5 +176,12 @@ func (s *ServerEnv) Close(ctx context.Context) error {
 	if s.database != nil {
 		s.database.Close(ctx)
 	}
+
+	if s.observabilityExporter != nil {
+		if err := s.observabilityExporter.Close(); err != nil {
+			return nil
+		}
+	}
+
 	return nil
 }
